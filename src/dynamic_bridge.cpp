@@ -125,7 +125,8 @@ bool parse_command_options(
 
 void update_bridge(
   ros::NodeHandle & ros1_node,
-  rclcpp::Node::SharedPtr ros2_node,
+  rclcpp::Node::SharedPtr ros2_node_for_pubs,
+  rclcpp::Node::SharedPtr ros2_node_for_subs,
   const std::map<std::string, std::string> & ros1_publishers,
   const std::map<std::string, std::string> & ros1_subscribers,
   const std::map<std::string, std::string> & ros2_publishers,
@@ -188,7 +189,7 @@ void update_bridge(
     }
     try {
       bridge.bridge_handles = ros1_bridge::create_bridge_from_1_to_2(
-        ros1_node, ros2_node,
+        ros1_node, ros2_node_for_pubs,
         bridge.ros1_type_name, topic_name, 10,
         bridge.ros2_type_name, topic_name, ros2_publisher_qos);
     } catch (std::runtime_error & e) {
@@ -254,7 +255,7 @@ void update_bridge(
 
     try {
       bridge.bridge_handles = ros1_bridge::create_bridge_from_2_to_1(
-        ros2_node, ros1_node,
+        ros2_node_for_subs, ros1_node,
         bridge.ros2_type_name, topic_name, 10,
         bridge.ros1_type_name, topic_name, 10);
     } catch (std::runtime_error & e) {
@@ -318,7 +319,7 @@ void update_bridge(
         "ros1", details.at("package"), details.at("name"));
       if (factory) {
         try {
-          service_bridges_2_to_1[name] = factory->service_bridge_2_to_1(ros1_node, ros2_node, name);
+          service_bridges_2_to_1[name] = factory->service_bridge_2_to_1(ros1_node, ros2_node_for_subs, name);
           printf("Created 2 to 1 bridge for service %s\n", name.data());
         } catch (std::runtime_error & e) {
           fprintf(stderr, "Failed to created a bridge: %s\n", e.what());
@@ -344,7 +345,7 @@ void update_bridge(
       if (factory) {
         try {
           service_bridges_1_to_2[name] = factory->service_bridge_1_to_2(
-            ros1_node, ros2_node, name, service_execution_timeout);
+            ros1_node, ros2_node_for_pubs, name, service_execution_timeout);
           printf("Created 1 to 2 bridge for service %s\n", name.data());
         } catch (std::runtime_error & e) {
           fprintf(stderr, "Failed to created a bridge: %s\n", e.what());
@@ -471,7 +472,12 @@ int main(int argc, char * argv[])
   // ROS 2 node
   rclcpp::init(argc, argv);
 
-  auto ros2_node = rclcpp::Node::make_shared("ros_bridge");
+  auto ros2_node_out = rclcpp::Node::make_shared("ros_bridge");
+  auto context = std::make_shared<rclcpp::Context>();
+  context->init(argc, argv);
+  rclcpp::NodeOptions node_options;
+  node_options.context(context);
+  auto ros2_node_in = rclcpp::Node::make_shared("ros_bridge", node_options);
 
   // ROS 1 node
   ros::init(argc, argv, "ros_bridge");
@@ -492,7 +498,7 @@ int main(int argc, char * argv[])
 
   // setup polling of ROS 1 master
   auto ros1_poll = [
-    &ros1_node, ros2_node,
+    &ros1_node, ros2_node_out, ros2_node_in,
     &ros1_publishers, &ros1_subscribers,
     &ros2_publishers, &ros2_subscribers,
     &bridges_1to2, &bridges_2to1,
@@ -611,7 +617,7 @@ int main(int argc, char * argv[])
       }
 
       update_bridge(
-        ros1_node, ros2_node,
+        ros1_node, ros2_node_out, ros2_node_in,
         ros1_publishers, ros1_subscribers,
         ros2_publishers, ros2_subscribers,
         ros1_services, ros2_services,
@@ -628,7 +634,7 @@ int main(int argc, char * argv[])
   std::set<std::string> already_ignored_topics;
   std::set<std::string> already_ignored_services;
   auto ros2_poll = [
-    &ros1_node, ros2_node,
+    &ros1_node, ros2_node_out, ros2_node_in,
     &ros1_publishers, &ros1_subscribers,
     &ros2_publishers, &ros2_subscribers,
     &ros1_services, &ros2_services,
@@ -639,7 +645,7 @@ int main(int argc, char * argv[])
     &already_ignored_topics, &already_ignored_services
     ]() -> void
     {
-      auto ros2_topics = ros2_node->get_topic_names_and_types();
+      auto ros2_topics = ros2_node_in->get_topic_names_and_types();
 
       std::set<std::string> ignored_topics;
       ignored_topics.insert("parameter_events");
@@ -673,8 +679,8 @@ int main(int argc, char * argv[])
           continue;
         }
 
-        auto publisher_count = ros2_node->count_publishers(topic_name);
-        auto subscriber_count = ros2_node->count_subscribers(topic_name);
+        auto publisher_count = ros2_node_out->count_publishers(topic_name);
+        auto subscriber_count = ros2_node_in->count_subscribers(topic_name);
 
         // ignore publishers from the bridge itself
         if (bridges_1to2.find(topic_name) != bridges_1to2.end()) {
@@ -707,19 +713,19 @@ int main(int argc, char * argv[])
       // collect available services (not clients)
       std::set<std::string> service_names;
       std::vector<std::pair<std::string, std::string>> node_names_and_namespaces =
-        ros2_node->get_node_graph_interface()->get_node_names_and_namespaces();
+        ros2_node_in->get_node_graph_interface()->get_node_names_and_namespaces();
       for (auto & pair : node_names_and_namespaces) {
-        if (pair.first == ros2_node->get_name() && pair.second == ros2_node->get_namespace()) {
+        if (pair.first == ros2_node_in->get_name() && pair.second == ros2_node_in->get_namespace()) {
           continue;
         }
         std::map<std::string, std::vector<std::string>> services_and_types =
-          ros2_node->get_service_names_and_types_by_node(pair.first, pair.second);
+          ros2_node_in->get_service_names_and_types_by_node(pair.first, pair.second);
         for (auto & it : services_and_types) {
           service_names.insert(it.first);
         }
       }
 
-      auto ros2_services_and_types = ros2_node->get_service_names_and_types();
+      auto ros2_services_and_types = ros2_node_in->get_service_names_and_types();
       std::map<std::string, std::map<std::string, std::string>> active_ros2_services;
       for (const auto & service_and_types : ros2_services_and_types) {
         auto & service_name = service_and_types.first;
@@ -775,7 +781,7 @@ int main(int argc, char * argv[])
       }
 
       update_bridge(
-        ros1_node, ros2_node,
+        ros1_node, ros2_node_out, ros2_node_in,
         ros1_publishers, ros1_subscribers,
         ros2_publishers, ros2_subscribers,
         ros1_services, ros2_services,
@@ -784,7 +790,7 @@ int main(int argc, char * argv[])
         bridge_all_1to2_topics, bridge_all_2to1_topics);
     };
 
-  auto ros2_poll_timer = ros2_node->create_wall_timer(
+  auto ros2_poll_timer = ros2_node_out->create_wall_timer(
     std::chrono::seconds(1), ros2_poll);
 
 
@@ -795,7 +801,8 @@ int main(int argc, char * argv[])
   // ROS 2 spinning loop
   rclcpp::executors::SingleThreadedExecutor executor;
   while (ros1_node.ok() && rclcpp::ok()) {
-    executor.spin_node_once(ros2_node);
+    executor.spin_node_once(ros2_node_out);
+    executor.spin_node_once(ros2_node_in);
   }
 
   return 0;
